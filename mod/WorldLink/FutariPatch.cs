@@ -214,10 +214,14 @@ public static class Futari
         .GetMethod("RecvStartRecruit", BindingFlags.NonPublic | BindingFlags.Instance);
     private static readonly MethodInfo RFinishRecruit = typeof(Client)
         .GetMethod("RecvFinishRecruit", BindingFlags.NonPublic | BindingFlags.Instance);
+    // Only touched on the main thread (postClientUpdate and the RecvStartRecruit prefix it triggers)
     private static Dictionary<string, RecruitInfo> lastRecruits = new();
+    // Latest list fetched by the polling thread that hasn't been applied yet (null = nothing new)
+    private static List<RecruitRecord> pendingRecruits;
+    private static System.Threading.Thread recruitPoller;
 
     private static string Identity(this RecruitInfo x) => $"{x.IpAddress} : {x.MusicID}";
-    
+
     // Client Constructor
     // Client:: public Client(string name, PartyLink.Party.InitParam initParam)
     [HarmonyPostfix]
@@ -225,26 +229,41 @@ public static class Futari
     public static void postClientConstruct(Client __instance, string name, PartyLink.Party.InitParam initParam)
     {
         Log.Debug($"new Client({name}, {initParam})");
-        10000.Interval(() => 
-            lastRecruits = $"{FutariClient.LOBBY_BASE}/recruit/list"
+        if (recruitPoller != null) return;
+
+        // The game's recruit list is a plain List that the main thread reads every frame,
+        // so this thread only fetches; the result is applied on the main thread in postClientUpdate
+        recruitPoller = 1000.Interval(() => System.Threading.Interlocked.Exchange(ref pendingRecruits,
+            $"{FutariClient.LOBBY_BASE}/recruit/list"
                 .Get().Trim().Split('\n')
                 .Where(x => !string.IsNullOrEmpty(x))
                 .Select(JsonUtility.FromJson<RecruitRecord>).ToList()
-                .Also(lst => lst
-                    .Select(x => x.RecruitInfo.Identity())
-                    .Do(ids => lastRecruits.Keys
-                        .Where(key => !ids.Contains(key))
-                        .Each(key => RFinishRecruit.Invoke(__instance, new[]{new Packet(lastRecruits[key].IpAddress)
-                            .Also(p => p.encode(new FinishRecruit(lastRecruits[key])))
-                        }))
-                    )
-                )
-                .Each(x => RStartRecruit.Invoke(__instance, new[]{new Packet(x.RecruitInfo.IpAddress)
-                    .Also(p => p.encode(new StartRecruit(x.RecruitInfo)))
-                }))
-                .Select(x => x.RecruitInfo)
-                .ToDictionary(x => x.Identity())
-        );
+        ));
+    }
+
+    // Apply the fetched recruit list on the main thread, which is also where the original game
+    // handles recruit packets received over UDP (Client.Update -> _udpSocket.recv())
+    // Client:: public void Update()
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(Client), "Update")]
+    public static void postClientUpdate(Client __instance)
+    {
+        var lst = System.Threading.Interlocked.Exchange(ref pendingRecruits, null);
+        if (lst == null) return;
+
+        var ids = lst.Select(x => x.RecruitInfo.Identity()).ToList();
+        lastRecruits.Keys
+            .Where(key => !ids.Contains(key))
+            .Each(key => RFinishRecruit.Invoke(__instance, new[]{new Packet(lastRecruits[key].IpAddress)
+                .Also(p => p.encode(new FinishRecruit(lastRecruits[key])))
+            }));
+
+        // Re-delivering every live recruit refreshes its RecvTime, the game drops recruits not seen for 60s
+        lst.Each(x => RStartRecruit.Invoke(__instance, new[]{new Packet(x.RecruitInfo.IpAddress)
+            .Also(p => p.encode(new StartRecruit(x.RecruitInfo)))
+        }));
+
+        lastRecruits = lst.Select(x => x.RecruitInfo).ToDictionary(x => x.Identity());
     }
     
     // Block start recruit if the song is not available
@@ -254,12 +273,18 @@ public static class Futari
     public static bool preRecvStartRecruit(Packet packet)
     {
         var inf = packet.getParam<StartRecruit>().RecruitInfo;
-        Log.Info($"RecvStartRecruit: {JsonUtility.ToJson(inf)}");
+        // The recruit list is polled every second and every live recruit is re-delivered each time,
+        // so only log recruits that weren't in the previous poll
+        var isNew = !lastRecruits.ContainsKey(inf.Identity());
+        if (isNew) Log.Info($"RecvStartRecruit: {JsonUtility.ToJson(inf)}");
         if (Singleton<DataManager>.Instance.GetMusic(inf.MusicID) == null)
         {
-            Log.Error($"Recruit received but music {inf.MusicID} is not available.");
-            Log.Error($"If you want to play with {string.Join(" and ", inf.MechaInfo.UserNames)},");
-            Log.Error("make sure you have the same game version and option packs installed.");
+            if (isNew)
+            {
+                Log.Error($"Recruit received but music {inf.MusicID} is not available.");
+                Log.Error($"If you want to play with {string.Join(" and ", inf.MechaInfo.UserNames)},");
+                Log.Error("make sure you have the same game version and option packs installed.");
+            }
             return PrefixRet.BLOCK_ORIGINAL;
         }
         return PrefixRet.RUN_ORIGINAL;
